@@ -1,120 +1,204 @@
 import os
 import random
 import logging
-from typing import List, Tuple
+import string
 from torch.utils.data import Dataset
-from transformers import PreTrainedTokenizerFast
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
-def augment_line(line: str) -> List[Tuple[str, str]]:
-    parts = line.strip().split('\\t')
-    if len(parts) != 2:
-        return []
+punct_chars = string.punctuation + '«»—''""‹›„‚'
+translator = str.maketrans('', '', punct_chars)
 
-    abk, rus = parts[0].strip(), parts[1].strip()
+def remove_punctuation(text):
+    return text.translate(translator).strip()
+
+def load_tsv_pairs(data_dir):
+    pairs = []
+    tsv_files = [
+        "translations_1.tsv",
+        "translations_2.tsv",
+        "translations_3.tsv",
+        "words.tsv",
+        "phrases.tsv"
+    ]
+    
+    for file_name in tsv_files:
+        file_path = os.path.join(data_dir, file_name)
+        if not os.path.exists(file_path):
+            continue
+            
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) >= 2:
+                    src = parts[0].strip()
+                    tgt = parts[1].strip()
+                    pairs.append((src, tgt))
+    
+    return pairs
+
+def generate_combined_sample(pairs):
+    if not pairs:
+        return ("", "")
+    
+    n = random.randint(1, 15)
+    selected_pairs = random.choices(pairs, k=n)
+    
+    separators = []
+    for _ in range(n-1):
+        if random.random() < 0.4:
+            sep = ' '
+        else:
+            sep = random.choice([', ', '; ', '\n'])
+        separators.append(sep)
+    
+    src_parts = []
+    tgt_parts = []
+    
+    for i, (src, tgt) in enumerate(selected_pairs):
+        src_parts.append(src)
+        tgt_parts.append(tgt)
+        
+        if i < len(separators):
+            src_parts.append(separators[i])
+            tgt_parts.append(separators[i])
+    
+    return (
+        ''.join(src_parts).strip(),
+        ''.join(tgt_parts).strip()
+    )
+
+def augment_line(src, tgt):
+    tgt = tgt[0].upper() + tgt[1:] if len(tgt) > 0 else tgt
     versions = []
+    
+    is_question = src.endswith('?') or tgt.endswith('?')
+    last_char = src[-1] if len(src) > 0 else ''
+    needs_punct = last_char in {'.', '!'} or last_char.isalpha()
+    
+    if is_question:
+        base = src.rstrip('?')
+        versions.append((base, tgt.rstrip('?') + '?'))
+        versions.append((base + '?', tgt.rstrip('?') + '?'))
+    elif needs_punct:
+        base = src.rstrip('.!')
+        versions.extend([
+            (base, tgt.rstrip('.!')),
+            (base + '.', tgt.rstrip('.!') + '.'),
+            (base + '!', tgt.rstrip('.!') + '!')
+        ])
+    else:
+        versions.append((src, tgt))
 
     transforms = [
         (str.lower, str.lower),
-        (str.lower, str.lower),
-        (lambda x: x.capitalize(), lambda x: x.capitalize()),
+        (str.capitalize, str.capitalize),
         (lambda x: x[0].upper() + x[1:] if len(x) > 0 else x, lambda x: x[0].upper() + x[1:] if len(x) > 0 else x),
-        (lambda x: x.title(), lambda x: x.title()),
+        (str.title, str.title),
+        (str.title, str),
+        (str.capitalize, str),
+        (lambda x: x.capitalize().lower(), str.lower),
     ]
-
-    for i, (abk_tr, rus_tr) in enumerate(transforms):
+    
+    for src_tr, tgt_tr in transforms:
         try:
-            src = abk_tr(abk)
-            tgt = rus_tr(rus)
-
-            if i == 2:
-                base_src = src.rstrip('.!')
-                base_tgt = tgt.rstrip('.!')
-                endings = ['', '.', '!']
-
-                for ending in endings:
-                    variant_src = base_src + ending
-                    variant_tgt = base_tgt + ending
-                    if len(variant_src) > 1 and len(variant_tgt) > 1:
-                        versions.append((variant_src, variant_tgt))
-            else:
-                if len(src) > 1 and len(tgt) > 1:
-                    versions.append((src, tgt))
-        except IndexError:
-            logger.warning(f"Skipping transformation due to short string: abk='{abk}', rus='{rus}'")
+            src1 = src_tr(src)
+            tgt1 = tgt_tr(tgt)
+            versions.append((src1, tgt1))
+        except:
             continue
 
     return versions
 
 class BilingualDataset(Dataset):
-    def __init__(self, data_dir: str, tokenizer: PreTrainedTokenizerFast, max_length: int = 64, is_val: bool = False):
+    def __init__(self, data_dir, tokenizer, max_length=64, is_val=False, add_synthetic=False):
+        self.lang_to_id = {'abk': 0, 'rus': 1}
         self.samples = []
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.is_val = is_val
-        self.processed_files_count = 0
-        self.augmented_files_multiplier = 3
-
-        important_files_keywords = {"dialog_my", "dialog_2", "phrases", "words", "main", "simple", "ru_worlds", "corrections", "number"}
-
+        
         for root, _, files in os.walk(data_dir):
             for file in files:
-                if file.endswith('.tsv') and (('val' in file) == is_val):
+                if file.endswith('.tsv') and ('val' in file) == is_val:
                     file_path = os.path.join(root, file)
-                    self.process_file(file_path)
-                    if not is_val and any(keyword in file for keyword in important_files_keywords):
-                        for _ in range(self.augmented_files_multiplier):
-                             self.process_file(file_path, use_augmentation=True)
-
-        random.shuffle(self.samples)
-        logger.info(f"Loaded {len(self.samples)} examples from {self.processed_files_count} files ({'validation' if is_val else 'training'}).")
-
-    def process_file(self, file_path: str, use_augmentation: bool = True):
-        self.processed_files_count +=1
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if self.is_val:
-                        parts = line.strip().split('\\t')
-                        if len(parts) == 2:
-                            src, tgt = parts[0].strip(), parts[1].strip()
-                            self.add_pair(src, tgt)
-                    elif use_augmentation:
-                        for src, tgt in augment_line(line):
-                             self.add_pair(src, tgt)
+                    if file in ['corpus_abkhaz.tsv', 'corpus_russian.tsv']:
+                        self.process_file(file_path)
                     else:
-                         parts = line.strip().split('\\t')
-                         if len(parts) == 2:
-                             src, tgt = parts[0].strip(), parts[1].strip()
-                             self.add_pair(src, tgt)
+                        self.process_file(file_path)
+                        if any(keyword in file for keyword in {"100text", "phrases", "words", "main", "ru_worlds", "corrections", "number"}):
+                            for i in range(3):
+                                self.process_file(file_path)
+        
+        if add_synthetic and not is_val:
+            logger.info("Generating synthetic examples from word combinations...")
+            pairs = load_tsv_pairs(data_dir)
+            if pairs:
+                for _ in tqdm(range(300000)):
+                    abk, rus = generate_combined_sample(pairs)
+                    if abk and rus:
+                        self.add_pair(abk, rus, src_lang='abk', tgt_lang='rus')
+                        self.add_pair(rus, abk, src_lang='rus', tgt_lang='abk')
+        
+        random.shuffle(self.samples)
+        logger.info(f"Loaded {len(self.samples)} examples")
 
-        except FileNotFoundError:
-            logger.error(f"File not found: {file_path}")
-        except Exception as e:
-            logger.error(f"Error processing file {file_path}: {e}")
+    def process_file(self, file_path):
+        file_name = os.path.basename(file_path)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) != 2:
+                    continue
+                abk, rus = parts[0].strip(), parts[1].strip()
+                
+                if file_name == 'corpus_abkhaz.tsv':
+                    self.add_pair(rus, abk, src_lang='rus', tgt_lang='abk')
+                        
+                elif file_name == 'corpus_russian.tsv':
+                    self.add_pair(abk, rus, src_lang='abk', tgt_lang='rus')
 
+                elif file_name == 'low_quality_russian.tsv':
+                    rn = random.random()
+                    if rn < 0.1 and len(rus) > 20:
+                        if rn < 0.04:
+                            self.add_pair(rus.capitalize().lower(), rus.lower(), src_lang='abk', tgt_lang='rus')
+                        elif rn < 0.08:
+                            self.add_pair(rus.capitalize(), rus, src_lang='abk', tgt_lang='rus')
+                        else:
+                            self.add_pair(rus, rus, src_lang='abk', tgt_lang='rus')
+                            
+                elif file_name == 'low_quality_abkhaz.tsv':
+                    rn = random.random()
+                    if rn < 0.15 and len(abk) > 20:
+                        if rn < 0.06:
+                            self.add_pair(abk.capitalize().lower(), abk.lower(), src_lang='rus', tgt_lang='abk')
+                        elif rn < 0.12:
+                            self.add_pair(abk.capitalize(), abk, src_lang='rus', tgt_lang='abk')
+                        else:
+                            self.add_pair(abk, abk, src_lang='rus', tgt_lang='abk')
+                else:
+                    if self.is_val:
+                        self.add_pair(abk, rus, src_lang='abk', tgt_lang='rus')
+                        self.add_pair(rus, abk, src_lang='rus', tgt_lang='abk')
+                    else:
+                        for augmented_src, original_tgt in augment_line(abk, rus):
+                            self.add_pair(augmented_src, original_tgt, src_lang='abk', tgt_lang='rus')
+                        for augmented_src, original_tgt in augment_line(rus, abk):
+                            self.add_pair(augmented_src, original_tgt, src_lang='rus', tgt_lang='abk')
 
-    def add_pair(self, src: str, tgt: str):
-        if len(src) > 0 and len(tgt) > 0:
-            self.samples.append({
-                "src": f">>abk<< {src}",
-                "tgt": tgt,
-                "target_lang": "rus"
-            })
-            self.samples.append({
-                "src": f">>rus<< {tgt}",
-                "tgt": src,
-                "target_lang": "abk"
-            })
-        else:
-            logger.warning(f"Skipping empty pair: src='{src}', tgt='{tgt}'")
+    def add_pair(self, src_text, tgt_text, src_lang, tgt_lang):
+        self.samples.append({
+            "src": f">>{src_lang}<< {src_text}",
+            "tgt": f">>{tgt_lang}<< {tgt_text}",
+            "target_lang": tgt_lang
+        })
 
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx):
         sample = self.samples[idx]
 
         src_enc = self.tokenizer(
@@ -134,13 +218,12 @@ class BilingualDataset(Dataset):
                 return_tensors="pt"
             )
 
-        if src_enc["input_ids"].shape[-1] > self.max_length or \
-           tgt_enc["input_ids"].shape[-1] > self.max_length:
-             logger.warning(f"Tokenized length exceeds max_length for sample index {idx}. Skipping.")
-             return self[(idx + 1) % len(self)]
+        if len(src_enc['input_ids'][0]) > self.max_length or len(tgt_enc['input_ids'][0]) > self.max_length:
+            return self[(idx + 1) % len(self)]
 
         return {
-            "input_ids": src_enc["input_ids"].squeeze(0),
-            "attention_mask": src_enc["attention_mask"].squeeze(0),
-            "labels": tgt_enc["input_ids"].squeeze(0)
+            "input_ids": src_enc["input_ids"].squeeze(),
+            "attention_mask": src_enc["attention_mask"].squeeze(),
+            "labels": tgt_enc["input_ids"].squeeze(),
+            "target_lang": self.lang_to_id[sample["target_lang"]]
         } 
